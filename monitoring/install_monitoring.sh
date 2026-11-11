@@ -43,7 +43,7 @@ echo "Configuration files found."
 # Install required packages
 # --------------------------------
 
-dnf install -y wget curl tar
+dnf install -y wget tar
 
 # --------------------------------
 # Install OpenTelemetry Collector
