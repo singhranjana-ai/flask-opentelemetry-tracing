@@ -43,7 +43,7 @@ echo "Configuration files found."
 # Install required packages
 # --------------------------------
 
-dnf install -y wget tar
+dnf install -y wget curl tar
 
 # --------------------------------
 # Install OpenTelemetry Collector
@@ -88,6 +88,12 @@ id tempo &>/dev/null || useradd --system --no-create-home tempo
 mkdir -p /var/lib/tempo/wal
 mkdir -p /var/lib/tempo/blocks
 mkdir -p /etc/tempo
+
+# Create shutdown marker directory required by Tempo
+
+install -d -o tempo -g tempo -m 755 /var/tempo
+
+# Set storage directory ownership
 
 chown -R tempo:tempo /var/lib/tempo
 
@@ -147,6 +153,7 @@ User=tempo
 Group=tempo
 ExecStart=/usr/local/bin/tempo -config.file=/etc/tempo/tempo.yaml -target=all
 Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -188,4 +195,4 @@ echo "systemctl status otelcol"
 echo "systemctl status grafana-server"
 
 echo ""
-echo "Installation successful!"
+echo "Installation completed. Verify all services before use."
