@@ -1,152 +1,93 @@
-
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
-# --------------------------------
-# Check root user
-# --------------------------------
-
-if [ "$EUID" -ne 0 ]; then
-    echo "Please run this script as root"
+# Run as root so packages and system services can be installed.
+if [ "${EUID}" -ne 0 ]; then
+    echo "ERROR: Run this script as root: sudo bash install_monitoring.sh"
     exit 1
 fi
-
-echo "Installing monitoring components..."
-
-# --------------------------------
-# Check architecture
-# --------------------------------
 
 if [ "$(uname -m)" != "x86_64" ]; then
-    echo "This script requires x86_64 architecture"
+    echo "ERROR: This lab installer currently supports x86_64 EC2 instances only."
     exit 1
 fi
 
-# --------------------------------
-# Check configuration files
-# --------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-for FILE in otel-collector.yaml tempo.yaml grafana-datasource.yaml
-do
-    if [ ! -f "$SCRIPT_DIR/$FILE" ]; then
-        echo "ERROR: $FILE not found in monitoring directory"
+for FILE in otel-collector.yaml tempo.yaml grafana-datasource.yaml; do
+    if [ ! -f "${SCRIPT_DIR}/${FILE}" ]; then
+        echo "ERROR: ${FILE} is missing from ${SCRIPT_DIR}"
         exit 1
     fi
 done
 
-echo "Configuration files found."
+echo "Installing required packages..."
+dnf install -y tar
 
-# --------------------------------
-# Install required packages
-# --------------------------------
+# Amazon Linux 2023 commonly provides curl-minimal. Do not force-install
+# the full curl package because it conflicts with curl-minimal.
+if ! command -v curl >/dev/null 2>&1; then
+    dnf install -y curl-minimal
+fi
 
-dnf install -y wget curl tar
+if ! command -v curl >/dev/null 2>&1; then
+    echo "ERROR: curl command is still unavailable."
+    exit 1
+fi
 
-# --------------------------------
-# Install OpenTelemetry Collector
-# --------------------------------
-
-echo "Installing OpenTelemetry Collector..."
-
+# OpenTelemetry Collector
 OTEL_VERSION="0.162.0"
-
-curl -fL -o /tmp/otelcol.rpm \
-"https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTEL_VERSION}/otelcol_${OTEL_VERSION}_linux_amd64.rpm"
-
+echo "Installing OpenTelemetry Collector ${OTEL_VERSION}..."
+curl -fL --retry 3 --retry-delay 2 -o /tmp/otelcol.rpm \
+    "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTEL_VERSION}/otelcol_${OTEL_VERSION}_linux_amd64.rpm"
 dnf install -y /tmp/otelcol.rpm
 
-# --------------------------------
-# Install Grafana Tempo
-# --------------------------------
-
-echo "Installing Grafana Tempo..."
-
+# Grafana Tempo
 TEMPO_VERSION="3.1.1"
-
-curl -fL -o /tmp/tempo.tar.gz \
-"https://github.com/grafana/tempo/releases/download/v${TEMPO_VERSION}/tempo_${TEMPO_VERSION}_linux_amd64.tar.gz"
-
+echo "Installing Grafana Tempo ${TEMPO_VERSION}..."
+curl -fL --retry 3 --retry-delay 2 -o /tmp/tempo.tar.gz \
+    "https://github.com/grafana/tempo/releases/download/v${TEMPO_VERSION}/tempo_${TEMPO_VERSION}_linux_amd64.tar.gz"
 mkdir -p /tmp/tempo-install
-
 tar -xzf /tmp/tempo.tar.gz -C /tmp/tempo-install
-
 install -m 755 /tmp/tempo-install/tempo /usr/local/bin/tempo
 
-# --------------------------------
-# Create Tempo user
-# --------------------------------
-
-id tempo &>/dev/null || useradd --system --no-create-home tempo
-
-# --------------------------------
-# Create Tempo storage directories
-# --------------------------------
-
-mkdir -p /var/lib/tempo/wal
-mkdir -p /var/lib/tempo/blocks
-mkdir -p /etc/tempo
-
-# Create shutdown marker directory required by Tempo
-
-install -d -o tempo -g tempo -m 755 /var/tempo
-
-# Set storage directory ownership
-
+# Dedicated unprivileged Tempo user and storage.
+id tempo >/dev/null 2>&1 || useradd --system --no-create-home --shell /sbin/nologin tempo
+mkdir -p /var/lib/tempo/wal /var/lib/tempo/blocks /etc/tempo
 chown -R tempo:tempo /var/lib/tempo
 
-# --------------------------------
-# Install Grafana
-# --------------------------------
-
+# Grafana repository and package.
 echo "Installing Grafana..."
-
-curl -fL -o /tmp/grafana.gpg \
-https://rpm.grafana.com/gpg.key
-
+curl -fL --retry 3 --retry-delay 2 -o /tmp/grafana.gpg https://rpm.grafana.com/gpg.key
 rpm --import /tmp/grafana.gpg
 
-cat > /etc/yum.repos.d/grafana.repo <<EOF
+cat > /etc/yum.repos.d/grafana.repo <<'REPO'
 [grafana]
 name=Grafana
 baseurl=https://rpm.grafana.com
-repo_gpgcheck=1
 enabled=1
+repo_gpgcheck=1
 gpgcheck=1
 gpgkey=https://rpm.grafana.com/gpg.key
 sslverify=1
-EOF
+REPO
 
 dnf install -y grafana
 
-# --------------------------------
-# Copy configuration files
-# --------------------------------
-
+# Install the repository configuration files.
 echo "Copying configuration files..."
+mkdir -p /etc/otelcol /etc/grafana/provisioning/datasources
+cp "${SCRIPT_DIR}/otel-collector.yaml" /etc/otelcol/config.yaml
+cp "${SCRIPT_DIR}/tempo.yaml" /etc/tempo/tempo.yaml
+cp "${SCRIPT_DIR}/grafana-datasource.yaml" /etc/grafana/provisioning/datasources/tempo.yaml
 
-mkdir -p /etc/otelcol
-mkdir -p /etc/grafana/provisioning/datasources
-
-cp "$SCRIPT_DIR/otel-collector.yaml" \
-/etc/otelcol/config.yaml
-
-cp "$SCRIPT_DIR/tempo.yaml" \
-/etc/tempo/tempo.yaml
-
-cp "$SCRIPT_DIR/grafana-datasource.yaml" \
-/etc/grafana/provisioning/datasources/tempo.yaml
-
-# --------------------------------
-# Create Tempo systemd service
-# --------------------------------
-
-cat > /etc/systemd/system/tempo.service <<EOF
+# Tempo systemd unit.
+cat > /etc/systemd/system/tempo.service <<'UNIT'
 [Unit]
 Description=Grafana Tempo
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 User=tempo
@@ -157,42 +98,30 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
-# --------------------------------
-# Start services
-# --------------------------------
-
-echo "Starting monitoring services..."
-
+# Enable and start services.
+echo "Enabling and starting monitoring services..."
 systemctl daemon-reload
-
-systemctl enable tempo
-systemctl enable otelcol
-systemctl enable grafana-server
-
+systemctl enable tempo otelcol grafana-server
 systemctl restart tempo
 systemctl restart otelcol
 systemctl restart grafana-server
 
-# --------------------------------
-# Installation completed
-# --------------------------------
-
-echo "--------------------------------"
-echo "Monitoring installation completed"
-echo "--------------------------------"
-
-echo "Tempo: http://localhost:3200"
-echo "Grafana: http://localhost:3000"
-echo "Collector: Port 4318"
+# Fail clearly if a service did not start.
+for SERVICE in tempo otelcol grafana-server; do
+    if ! systemctl is-active --quiet "${SERVICE}"; then
+        echo "ERROR: ${SERVICE} did not start. Recent logs:"
+        journalctl -u "${SERVICE}" -n 40 --no-pager || true
+        exit 1
+    fi
+done
 
 echo ""
-echo "Check services:"
-
-echo "systemctl status tempo"
-echo "systemctl status otelcol"
-echo "systemctl status grafana-server"
-
+echo "Monitoring installation completed successfully."
+echo "Grafana:  http://<MONITORING_EC2_PUBLIC_IP>:3000"
+echo "Tempo:    http://localhost:3200"
+echo "OTLP/HTTP collector receiver: port 4318"
 echo ""
-echo "Installation completed. Verify all services before use."
+echo "Service status:"
+systemctl --no-pager --full status tempo otelcol grafana-server
